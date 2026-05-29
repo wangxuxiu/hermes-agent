@@ -175,48 +175,6 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     return None
 
 
-def _version_tuple(v: str) -> tuple[int, ...]:
-    """Parse '0.13.0' into (0, 13, 0) for comparison. Non-numeric segments become 0."""
-    parts = []
-    for segment in v.split("."):
-        try:
-            parts.append(int(segment))
-        except ValueError:
-            parts.append(0)
-    return tuple(parts)
-
-
-def _fetch_pypi_latest(package: str = "hermes-agent") -> Optional[str]:
-    """Fetch the latest version of a package from PyPI. Returns None on failure."""
-    try:
-        import urllib.request
-        url = f"https://pypi.org/pypi/{package}/json"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            return data.get("info", {}).get("version")
-    except Exception:
-        return None
-
-
-def check_via_pypi() -> Optional[int]:
-    """Compare installed version against PyPI latest.
-
-    Returns 0 if up-to-date, 1 if behind, None on failure.
-    """
-    latest = _fetch_pypi_latest()
-    if latest is None:
-        return None
-    if latest == VERSION:
-        return 0
-    try:
-        if _version_tuple(latest) > _version_tuple(VERSION):
-            return 1
-        return 0
-    except Exception:
-        return 1 if latest != VERSION else 0
-
-
 def check_for_updates() -> Optional[int]:
     """Check whether a Hermes update is available.
 
@@ -248,16 +206,12 @@ def check_for_updates() -> Optional[int]:
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
     else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
+        repo_dir = hermes_home / "hermes-agent"
         if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
+            repo_dir = Path(__file__).parent.parent.resolve()
         if not (repo_dir / ".git").exists():
-            behind = check_via_pypi()
-        else:
-            behind = _check_via_local_git(repo_dir)
+            return None
+        behind = _check_via_local_git(repo_dir)
 
     try:
         cache_file.write_text(json.dumps({"ts": now, "behind": behind, "rev": embedded_rev}))
@@ -268,16 +222,11 @@ def check_for_updates() -> Optional[int]:
 
 
 def _resolve_repo_dir() -> Optional[Path]:
-    """Return the active Hermes git checkout, or None if this isn't a git install.
-
-    Prefers the running code's location over the profile-scoped path
-    because ``$HERMES_HOME/hermes-agent/`` may be a stale copy carried
-    over by ``--clone-all``.
-    """
-    repo_dir = Path(__file__).parent.parent.resolve()
+    """Return the active Hermes git checkout, or None if this isn't a git install."""
+    hermes_home = get_hermes_home()
+    repo_dir = hermes_home / "hermes-agent"
     if not (repo_dir / ".git").exists():
-        hermes_home = get_hermes_home()
-        repo_dir = hermes_home / "hermes-agent"
+        repo_dir = Path(__file__).parent.parent.resolve()
     return repo_dir if (repo_dir / ".git").exists() else None
 
 
@@ -300,42 +249,14 @@ def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
 
 
 def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
-    """Return upstream/local git hashes for the startup banner.
-
-    For source installs and dev images this runs ``git rev-parse`` against
-    the active checkout.  When no checkout is available — the canonical case
-    is the published Docker image, which excludes ``.git`` from the build
-    context — we fall back to the baked-in build SHA (see
-    ``hermes_cli/build_info.py``) and return it as a frozen
-    ``upstream == local`` state with ``ahead=0``.  A built image is by
-    definition pinned to one commit, so "ahead" is always zero and the
-    banner correctly shows ``· upstream <sha>`` with no carried-commits
-    annotation.
-    """
+    """Return upstream/local git hashes for the startup banner."""
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:
-        # No git checkout — try the baked build SHA (Docker image path).
-        try:
-            from hermes_cli.build_info import get_build_sha
-            baked = get_build_sha(short=8)
-            if baked:
-                return {"upstream": baked, "local": baked, "ahead": 0}
-        except Exception:
-            pass
         return None
 
     upstream = _git_short_hash(repo_dir, "origin/main")
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
-        # Live-git lookup failed (e.g. shallow clone without origin/main).
-        # Fall back to the baked build SHA if available.
-        try:
-            from hermes_cli.build_info import get_build_sha
-            baked = get_build_sha(short=8)
-            if baked:
-                return {"upstream": baked, "local": baked, "ahead": 0}
-        except Exception:
-            pass
         return None
 
     ahead = 0
@@ -413,10 +334,10 @@ def format_banner_version_label() -> str:
     ahead = int(state.get("ahead") or 0)
 
     if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
+        return f"{base} · 上游 {upstream}"
 
-    carried_word = "commit" if ahead == 1 else "commits"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {carried_word})"
+    carried_word = "提交" if ahead == 1 else "提交"
+    return f"{base} · 上游 {upstream} · 本地 {local} (+{ahead} 个待推送 {carried_word})"
 
 
 # =========================================================================
@@ -467,12 +388,66 @@ def _format_context_length(tokens: int) -> str:
 def _display_toolset_name(toolset_name: str) -> str:
     """Normalize internal/legacy toolset identifiers for banner display."""
     if not toolset_name:
-        return "unknown"
-    return (
+        return "未知"
+    name = (
         toolset_name[:-6]
         if toolset_name.endswith("_tools")
         else toolset_name
     )
+    # 工具集名称汉化映射
+    _toolset_map = {
+        "browser": "浏览器",
+        "browser-cdp": "浏览器调试",
+        "camofox-browser": "Camofox浏览器",
+        "clarify": "询问确认",
+        "code_execution": "代码执行",
+        "cronjob": "定时任务",
+        "delegation": "任务委托",
+        "discord": "Discord",
+        "discord_admin": "Discord管理",
+        "email": "电子邮件",
+        "feishu": "飞书",
+        "file": "文件操作",
+        "github": "代码仓库",
+        "hermes-yuanbao": "元宝助手",
+        "homeassistant": "智能家居",
+        "image_gen": "图像生成",
+        "kanban": "看板管理",
+        "memory": "记忆管理",
+        "messaging": "消息通讯",
+        "mcp": "MCP协议",
+        "mixture_of_agents": "混合代理",
+        "moa": "混合代理",
+        "note-taking": "笔记记录",
+        "obsidian": "Obsidian笔记",
+        "plugins": "插件系统",
+        "productivity": "效率工具",
+        "profiles": "配置管理",
+        "red-teaming": "安全测试",
+        "research": "研究工具",
+        "rl": "强化学习",
+        "search": "搜索工具",
+        "session_search": "会话搜索",
+        "skills": "技能管理",
+        "smart-home": "智能家居",
+        "social-media": "社交媒体",
+        "software-development": "软件开发",
+        "spotify": "Spotify音乐",
+        "terminal": "终端命令",
+        "text-to-speech": "语音合成",
+        "todo": "待办事项",
+        "tts": "语音合成",
+        "vision": "视觉分析",
+        "vision_analyze": "图像分析",
+        "web": "网页工具",
+        "web_extract": "网页提取",
+        "web-scraping": "网页抓取",
+        "wechat": "微信",
+        "yuanbao": "元宝助手",
+        "other": "其他工具",
+        "unknown": "未知工具",
+    }
+    return _toolset_map.get(name, name)
 
 
 def build_welcome_banner(console: Console, model: str, cwd: str,
@@ -541,15 +516,12 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
         model_short = model_short[:25] + "..."
     ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
     left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
-
-    if os.getenv("HERMES_YOLO_MODE"):
-        left_lines.append(f"[bold red]⚠ YOLO mode[/] [dim {dim}]— all approval prompts bypassed[/]")
     left_lines.append(f"[dim {dim}]{cwd}[/]")
     if session_id:
-        left_lines.append(f"[dim {session_color}]Session: {session_id}[/]")
+        left_lines.append(f"[dim {session_color}]会话: {session_id}[/]")
     left_content = "\n".join(left_lines)
 
-    right_lines = [f"[bold {accent}]Available Tools[/]"]
+    right_lines = [f"[bold {accent}]可用工具[/]"]
     toolsets_dict: Dict[str, list] = {}
 
     for tool in tools:
@@ -606,7 +578,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
         right_lines.append(f"[dim {dim}]{toolset}:[/] {tools_str}")
 
     if remaining_toolsets > 0:
-        right_lines.append(f"[dim {dim}](and {remaining_toolsets} more toolsets...)[/]")
+        right_lines.append(f"[dim {dim}](还有 {remaining_toolsets} 个工具集...)[/]")
 
     # MCP Servers section (only if configured)
     try:
@@ -617,7 +589,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
 
     if mcp_status:
         right_lines.append("")
-        right_lines.append(f"[bold {accent}]MCP Servers[/]")
+        right_lines.append(f"[bold {accent}]MCP 服务器[/]")
         for srv in mcp_status:
             if srv["connected"]:
                 right_lines.append(
@@ -631,43 +603,64 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
                 )
 
     right_lines.append("")
-    right_lines.append(f"[bold {accent}]Available Skills[/]")
+    right_lines.append(f"[bold {accent}]可用技能[/]")
     skills_by_category = get_available_skills()
     total_skills = sum(len(s) for s in skills_by_category.values())
 
     if skills_by_category:
+        # 技能分类名称汉化映射
+        _category_map = {
+            "autonomous-ai-agents": "AI代理",
+            "browser-automation": "浏览器自动化",
+            "creative": "创意设计",
+            "data-science": "数据科学",
+            "devops": "运维开发",
+            "email": "电子邮件",
+            "gaming": "游戏娱乐",
+            "github": "代码仓库",
+            "leisure": "生活休闲",
+            "mcp": "MCP协议",
+            "media": "媒体处理",
+            "messaging": "消息通讯",
+            "mlops": "机器学习运维",
+            "mlops-cloud": "云机器学习",
+            "mlops-evaluation": "模型评估",
+            "mlops-inference": "模型推理",
+            "mlops-models": "模型架构",
+            "mlops-research": "研究工具",
+            "mlops-training": "模型训练",
+            "note-taking": "笔记记录",
+            "private-aggregated-search-cn": "聚合搜索",
+            "productivity": "效率工具",
+            "red-teaming": "安全测试",
+            "research": "学术研究",
+            "smart-home": "智能家居",
+            "social-media": "社交媒体",
+            "software-development": "软件开发",
+            "web-scraping": "网页抓取",
+            "yuanbao": "元宝助手",
+            "general": "通用技能",
+        }
         for category in sorted(skills_by_category.keys()):
             skill_names = sorted(skills_by_category[category])
             if len(skill_names) > 8:
                 display_names = skill_names[:8]
-                skills_str = ", ".join(display_names) + f" +{len(skill_names) - 8} more"
+                skills_str = ", ".join(display_names) + f" +{len(skill_names) - 8} 个更多"
             else:
                 skills_str = ", ".join(skill_names)
             if len(skills_str) > 50:
                 skills_str = skills_str[:47] + "..."
-            right_lines.append(f"[dim {dim}]{category}:[/] [{text}]{skills_str}[/]")
+            display_category = _category_map.get(category, category)
+            right_lines.append(f"[dim {dim}]{display_category}:[/] [{text}]{skills_str}[/]")
     else:
-        right_lines.append(f"[dim {dim}]No skills installed[/]")
+        right_lines.append(f"[dim {dim}]未安装技能[/]")
 
     right_lines.append("")
     mcp_connected = sum(1 for s in mcp_status if s["connected"]) if mcp_status else 0
-    summary_parts = [f"{len(tools)} tools", f"{total_skills} skills"]
+    summary_parts = [f"{len(tools)} 个工具", f"{total_skills} 个技能"]
     if mcp_connected:
-        summary_parts.append(f"{mcp_connected} MCP servers")
-    summary_parts.append("/help for commands")
-    # Indicate when the codex_app_server runtime is active so users
-    # understand why tool counts may not match what's actually reachable
-    # (codex builds its own tool list inside the spawned subprocess).
-    try:
-        from hermes_cli.codex_runtime_switch import get_current_runtime
-        from hermes_cli.config import load_config as _load_cfg
-        if get_current_runtime(_load_cfg()) == "codex_app_server":
-            right_lines.append(
-                f"[bold {accent}]Runtime:[/] [{text}]codex app-server[/] "
-                f"[dim {dim}](terminal/file ops/MCP run inside codex)[/]"
-            )
-    except Exception:
-        pass
+        summary_parts.append(f"{mcp_connected} 个 MCP 服务器")
+    summary_parts.append("输入 /help 查看命令")
     # Show active profile name when not 'default'
     try:
         from hermes_cli.profiles import get_active_profile_name
